@@ -1,100 +1,38 @@
+# src/train.py
 import argparse
-import csv
 import os
-from pathlib import Path
-import sys
-import glob
-
-import numpy as np
-from sklearn.linear_model import LogisticRegression
 import joblib
+import numpy as np
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
 
-
-TRAIN_CHANNEL = Path(os.environ.get("SM_CHANNEL_TRAIN", "/opt/ml/input/data/train"))
-MODEL_DIR     = Path(os.environ.get("SM_MODEL_DIR", "/opt/ml/model"))
-
-
-def _pick_train_csv() -> Path:
-    """
-    Return a Path to a CSV file under the train channel.
-    Prefer .../train.csv, else first *.csv we can find.
-    Raise a clear error if nothing is found.
-    """
-    p = TRAIN_CHANNEL / "train.csv"
-    if p.exists():
-        return p
-    # fall back to any CSV
-    cands = sorted(glob.glob(str(TRAIN_CHANNEL / "**" / "*.csv"), recursive=True))
-    if cands:
-        return Path(cands[0])
-    raise FileNotFoundError(
-        f"No CSV found under train channel: {TRAIN_CHANNEL}. "
-        "Ensure preprocess step wrote train.csv to the 'train' output and that "
-        "the TrainingStep maps that S3 URI to channel name 'train'."
-    )
-
-
-def _load_csv_with_header(p: Path):
-    """
-    Load CSV with a header row; last column is the label.
-    Robust to stray whitespace; raises a clear error if non-numeric cells appear.
-    """
-    with open(p, "r") as f:
-        rows = list(csv.reader(f))
-    if not rows:
-        raise ValueError(f"CSV appears empty: {p}")
-    header = rows[0]
-    data_rows = rows[1:]
-    if not data_rows:
-        raise ValueError(f"CSV has header but no data: {p}")
-
-    try:
-        data = np.array(data_rows, dtype=float)
-    except ValueError as e:
-        # Try a whitespace-trimmed pass before failing
-        trimmed = [[c.strip() for c in r] for r in data_rows]
-        try:
-            data = np.array(trimmed, dtype=float)
-        except Exception:
-            raise ValueError(f"Could not parse numeric values from {p}: {e}") from e
-
-    if data.ndim != 2 or data.shape[1] < 2:
-        raise ValueError(f"Expected tabular data with features+label; got shape {data.shape} from {p}")
-
-    X, y = data[:, :-1], data[:, -1].astype(int)
-    if np.unique(y).size < 2:
-        raise ValueError("Label column has <2 classes; need a binary classification target.")
-    return header, X, y
-
+def load_dataset(train_dir: str):
+    path = os.path.join(train_dir, "train.csv")
+    data = np.genfromtxt(path, delimiter=",")
+    if data.ndim == 1:
+        data = data.reshape(1, -1)
+    X, y = data[:, :-1], data[:, -1]
+    if np.all(np.mod(y, 1) == 0):
+        y = y.astype(int)
+    return X, y
 
 def main():
-    # Be tolerant of unknown args (containers sometimes add their own)
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--max_iter", type=int, default=200)
-    ap.add_argument("--C", type=float, default=1.0)
-    args, _unknown = ap.parse_known_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--max_iter", type=int, default=int(os.environ.get("MAX_ITER", 1000)))
+    p.add_argument("--C", type=float, default=float(os.environ.get("C", 2.0)))
+    p.add_argument("--model-dir", type=str, default=os.environ.get("SM_MODEL_DIR", "/opt/ml/model"))
+    p.add_argument("--output-data-dir", type=str, default=os.environ.get("SM_OUTPUT_DATA_DIR", "/opt/ml/output/data"))
+    p.add_argument("--train", type=str, default=os.environ.get("SM_CHANNEL_TRAIN", "/opt/ml/input/data/train"))
+    args, _ = p.parse_known_args()
 
-    print(f"[train.py] TRAIN_CHANNEL={TRAIN_CHANNEL}")
-    csv_path = _pick_train_csv()
-    print(f"[train.py] Using training CSV: {csv_path}")
-
-    header, X, y = _load_csv_with_header(csv_path)
-    print(f"[train.py] Loaded X.shape={X.shape}, y.shape={y.shape}, features={header[:-1]}")
-
-    clf = LogisticRegression(max_iter=args.max_iter, C=args.C)
+    X, y = load_dataset(args.train)
+    clf = make_pipeline(StandardScaler(with_mean=True), LogisticRegression(max_iter=args.max_iter, C=args.C))
     clf.fit(X, y)
 
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = MODEL_DIR / "model.joblib"
-    joblib.dump(clf, out_path)
-    print(f"[train.py] Saved model to {out_path}")
-
+    os.makedirs(args.model_dir, exist_ok=True)
+    joblib.dump(clf, os.path.join(args.model_dir, "model.joblib"))
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        # Print full error and exit non-zero so the container surfaces it
-        print(f"[train.py] ERROR: {e}", file=sys.stderr)
-        raise
+    main()
 

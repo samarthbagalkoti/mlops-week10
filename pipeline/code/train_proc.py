@@ -27,8 +27,9 @@ def main():
 
     out_dir = Path(args.model_dir); out_dir.mkdir(parents=True, exist_ok=True)
     model_file = out_dir / "model.joblib"
+    _tar = out_dir / "model.tar.gz"
     joblib.dump(clf, model_file)
-    _tar_model(model_file, out_dir / "model.tar.gz")
+    _tar_model(model_file, _tar)
     print("Saved model.joblib and model.tar.gz")
 
 if __name__ == "__main__":
