@@ -30,6 +30,7 @@ def main():
     acc = float((clf.predict(X) == y).mean())
 
     out = Path(args.report_dir); out.mkdir(parents=True, exist_ok=True)
+    # PROC pipeline uses this JSON path:
     (out / "evaluation.json").write_text(json.dumps({"metrics": {"accuracy": {"value": acc}}}))
     print(f"accuracy={acc:.4f}")
 

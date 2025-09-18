@@ -3,7 +3,11 @@
 """
 Unified W10 SageMaker Pipelines
 - proc: processing-only pipeline (preprocess -> train_proc -> evaluate -> accuracy gate)
-- reg : estimator + model registry + batch transform (model created from trained artifacts for BT)
+- reg : estimator + HPO + model registry + create model + batch transform
+
+This file merges the previously working script with the new features,
+while keeping the original behavior and SDK usage patterns that worked
+in your environment (SM SDK v2.251.x).
 """
 
 import argparse
@@ -44,7 +48,7 @@ for noisy in ["sagemaker.image_uris", "sagemaker.workflow.utilities", "botocore.
 from sagemaker.workflow.pipeline import Pipeline
 from sagemaker.workflow.pipeline_context import PipelineSession
 from sagemaker.workflow.parameters import ParameterString, ParameterFloat
-from sagemaker.workflow.steps import ProcessingStep, TrainingStep, TransformStep
+from sagemaker.workflow.steps import ProcessingStep, TrainingStep, TransformStep, TuningStep
 from sagemaker.workflow.properties import PropertyFile
 from sagemaker.workflow.functions import JsonGet, Join
 from sagemaker.workflow.condition_step import ConditionStep
@@ -55,10 +59,11 @@ from sagemaker.inputs import TrainingInput, TransformInput
 from sagemaker.sklearn.processing import SKLearnProcessor
 from sagemaker.sklearn.estimator import SKLearn
 from sagemaker.sklearn.model import SKLearnModel
-from sagemaker.workflow.model_step import ModelStep
 from sagemaker.transformer import Transformer
 from sagemaker.workflow.step_collections import RegisterModel
 from sagemaker.model_metrics import ModelMetrics, MetricsSource
+from sagemaker.workflow.model_step import ModelStep
+from sagemaker.tuner import HyperparameterTuner, ContinuousParameter, IntegerParameter
 
 # -------------------------------------------------------------------------------------
 # Common helpers
@@ -337,7 +342,7 @@ def build_pipeline_proc(
     )
 
 # =====================================================================================
-#                    Estimator + Model Registry + Batch (reg)
+#                    Estimator + HPO + Model Registry + Batch (reg)
 # =====================================================================================
 
 PIPELINE_NAME_REG = "w10d1-hello-sm-pipeline"
@@ -370,7 +375,7 @@ def ensure_model_package_group(region: str, group_name: str):
         if code in ("ValidationException", "ResourceNotFoundException") and "does not exist" in msg:
             sm.create_model_package_group(
                 ModelPackageGroupName=group_name,
-                ModelPackageGroupDescription="W10:D2/D3 demo group"
+                ModelPackageGroupDescription="W10:D2/D3/D4 demo group"
             )
             print(f"Created Model Package Group '{group_name}'.")
         else:
@@ -387,6 +392,8 @@ def build_pipeline_reg(
     train_instance: str,
     batch_instance: str = "ml.m5.large",
     batch_output_prefix: str = "",
+    hpo_max_jobs: int = 6,
+    hpo_parallel_jobs: int = 2,
 ) -> Pipeline:
     sess = _pipeline_session(region)
     default_bucket = sess.default_bucket() if not bucket else bucket
@@ -402,7 +409,7 @@ def build_pipeline_reg(
         default_value=batch_output_prefix or f"s3://{default_bucket}/{s3_prefix}/batch/predictions"
     )
 
-    # Preprocess
+    # Preprocess (now writes train/val/test for HPO + eval)
     sklearn_proc = SKLearnProcessor(
         framework_version=framework_version,
         role=role_arn,
@@ -418,13 +425,19 @@ def build_pipeline_reg(
         outputs=[
             ProcessingOutput(output_name="train_data", source="/opt/ml/processing/train",
                              destination=f"s3://{default_bucket}/{s3_prefix}/data/train"),
+            ProcessingOutput(output_name="val_data", source="/opt/ml/processing/validation",
+                             destination=f"s3://{default_bucket}/{s3_prefix}/data/validation"),
             ProcessingOutput(output_name="test_data", source="/opt/ml/processing/test",
                              destination=f"s3://{default_bucket}/{s3_prefix}/data/test"),
         ],
         job_arguments=["--samples", "3000", "--features", "20", "--informative", "10", "--random-state", "42"],
     )
 
-    # Train
+    # Base estimator + metric defs (parsed from your train.py prints)
+    metric_defs = [
+        {"Name": "val_accuracy", "Regex": r"val_accuracy=([0-9\\.]+)"},
+        {"Name": "train_accuracy", "Regex": r"train_accuracy=([0-9\\.]+)"},
+    ]
     train_instance = _normalize_training_instance(train_instance)
     estimator = SKLearn(
         entry_point="src/train.py",
@@ -434,18 +447,38 @@ def build_pipeline_reg(
         framework_version=framework_version,
         sagemaker_session=sess,
         base_job_name="w10d1-train",
-        hyperparameters={"max_iter": 1000, "C": 2.0},
-    )
-    step_train = TrainingStep(
-        name="Train",
-        estimator=estimator,
-        inputs={"train": TrainingInput(
-            s3_data=step_preprocess.properties.ProcessingOutputConfig.Outputs["train_data"].S3Output.S3Uri,
-            content_type="text/csv",
-        )},
+        hyperparameters={"max_iter": 200, "C": 1.0},
+        metric_definitions=metric_defs,
     )
 
-    # Evaluate
+    # HPO ranges & tuner
+    hpo_ranges = {
+        "C": ContinuousParameter(0.01, 10.0, scaling_type="Logarithmic"),
+        "max_iter": IntegerParameter(100, 1000),
+    }
+    tuner = HyperparameterTuner(
+        estimator=estimator,
+        objective_metric_name="val_accuracy",
+        objective_type="Maximize",
+        hyperparameter_ranges=hpo_ranges,
+        max_jobs=hpo_max_jobs,
+        max_parallel_jobs=hpo_parallel_jobs,
+        strategy="Bayesian",
+    )
+    step_hpo = TuningStep(
+        name="HPO",
+        tuner=tuner,
+        inputs={
+            "train": TrainingInput(
+                s3_data=step_preprocess.properties.ProcessingOutputConfig.Outputs["train_data"].S3Output.S3Uri,
+                content_type="text/csv"),
+            "validation": TrainingInput(
+                s3_data=step_preprocess.properties.ProcessingOutputConfig.Outputs["val_data"].S3Output.S3Uri,
+                content_type="text/csv"),
+        },
+    )
+
+    # Evaluate BEST model on TEST
     eval_proc = SKLearnProcessor(
         framework_version=framework_version,
         role=role_arn,
@@ -460,27 +493,37 @@ def build_pipeline_reg(
         processor=eval_proc,
         code="src/evaluate.py",
         inputs=[
-            ProcessingInput(source=step_train.properties.ModelArtifacts.S3ModelArtifacts,
-                            destination="/opt/ml/processing/model", input_name="model_artifacts"),
-            ProcessingInput(source=step_preprocess.properties.ProcessingOutputConfig.Outputs["test_data"].S3Output.S3Uri,
-                            destination="/opt/ml/processing/test", input_name="test_data"),
+            ProcessingInput(
+                source=step_hpo.get_top_model_s3_uri(top_k=0, s3_bucket=default_bucket),
+                destination="/opt/ml/processing/model",
+                input_name="model_artifacts",
+            ),
+            ProcessingInput(
+                source=step_preprocess.properties.ProcessingOutputConfig.Outputs["test_data"].S3Output.S3Uri,
+                destination="/opt/ml/processing/test",
+                input_name="test_data",
+            ),
         ],
-        outputs=[ProcessingOutput(output_name="evaluation",
-                                  source="/opt/ml/processing/evaluation",
-                                  destination=f"s3://{default_bucket}/{s3_prefix}/evaluation")],
+        outputs=[ProcessingOutput(
+            output_name="evaluation",
+            source="/opt/ml/processing/evaluation",
+            destination=f"s3://{default_bucket}/{s3_prefix}/evaluation",
+        )],
         property_files=[eval_report],
     )
 
     # Gate (REG pipeline expects {"binary_classification_metrics":{"accuracy": <float>}})
-    acc_json = JsonGet(step_name=step_evaluate.name,
-                       property_file=eval_report,
-                       json_path="binary_classification_metrics.accuracy")
+    acc_json = JsonGet(
+        step_name=step_evaluate.name,
+        property_file=eval_report,
+        json_path="binary_classification_metrics.accuracy",
+    )
     step_fail = FailStep(name="FailIfLowAccuracy", error_message="Model accuracy below threshold")
     cond = ConditionGreaterThanOrEqualTo(left=acc_json, right=p_accuracy_threshold)
 
-    # Script-mode inference model (src/inference.py) based on training artifacts
+    # Script-mode inference model (src/inference.py) based on BEST artifacts
     inference_model = SKLearnModel(
-        model_data=step_train.properties.ModelArtifacts.S3ModelArtifacts,
+        model_data=step_hpo.get_top_model_s3_uri(top_k=0, s3_bucket=default_bucket),
         role=role_arn,
         entry_point="src/inference.py",
         framework_version=framework_version,
@@ -490,10 +533,11 @@ def build_pipeline_reg(
     # Attach metrics to registration
     eval_s3_uri = step_evaluate.properties.ProcessingOutputConfig.Outputs["evaluation"].S3Output.S3Uri
     metrics_s3_uri = Join(on="", values=[eval_s3_uri, "/evaluation.json"])
-    model_metrics = ModelMetrics(model_statistics=MetricsSource(s3_uri=metrics_s3_uri,
-                                                                content_type="application/json"))
+    model_metrics = ModelMetrics(
+        model_statistics=MetricsSource(s3_uri=metrics_s3_uri, content_type="application/json")
+    )
 
-    # Register in Model Registry (IMPORTANT: hosting instances must be allowed set; t3.* not allowed)
+    # Register in Model Registry (NOTE: hosting instances must be from allowed set; no t3.* here)
     register_step = RegisterModel(
         name="RegisterModel",
         model=inference_model,
@@ -510,7 +554,7 @@ def build_pipeline_reg(
     create_model_args = inference_model.create()
     step_create_model = ModelStep(name="CreateModelForBatch", step_args=create_model_args)
 
-    # Batch Transform
+    # Batch Transform (on TEST split)
     transformer = Transformer(
         model_name=step_create_model.properties.ModelName,
         instance_count=1,
@@ -537,7 +581,7 @@ def build_pipeline_reg(
     return Pipeline(
         name=PIPELINE_NAME_REG,
         parameters=[p_accuracy_threshold, p_model_pkg_group, p_model_approval, p_batch_instance, p_batch_output],
-        steps=[step_preprocess, step_train, step_evaluate, step_condition],
+        steps=[step_preprocess, step_hpo, step_evaluate, step_condition],
         sagemaker_session=sess,
     )
 
@@ -550,25 +594,34 @@ def _ensure_reg_pipeline(region: str,
                          proc_instance: str,
                          train_instance: str,
                          batch_instance: str,
-                         batch_output_prefix: str):
+                         batch_output_prefix: str,
+                         hpo_max_jobs: int,
+                         hpo_parallel_jobs: int):
     ensure_model_package_group(region, group_name)
-    pipe = build_pipeline_reg(region, role_arn, bucket, acc_threshold, group_name, approval_status,
-                              proc_instance=proc_instance, train_instance=train_instance,
-                              batch_instance=batch_instance, batch_output_prefix=batch_output_prefix)
+    pipe = build_pipeline_reg(
+        region, role_arn, bucket, acc_threshold, group_name, approval_status,
+        proc_instance=proc_instance, train_instance=train_instance,
+        batch_instance=batch_instance, batch_output_prefix=batch_output_prefix,
+        hpo_max_jobs=hpo_max_jobs, hpo_parallel_jobs=hpo_parallel_jobs,
+    )
     pipe.upsert(role_arn=role_arn)
     print(f"Ensured pipeline: {pipe.name}")
 
 def reg_cmd_upsert(args):
-    _ensure_reg_pipeline(region=args.region,
-                         role_arn=args.role_arn,
-                         bucket=args.bucket,
-                         acc_threshold=args.accuracy_threshold,
-                         group_name=args.group_name,
-                         approval_status=args.approval,
-                         proc_instance=args.proc_instance,
-                         train_instance=args.train_instance,
-                         batch_instance=args_batch_instance if hasattr(args, "args_batch_instance") else args.batch_instance,
-                         batch_output_prefix=args.batch_output_prefix)
+    _ensure_reg_pipeline(
+        region=args.region,
+        role_arn=args.role_arn,
+        bucket=args.bucket,
+        acc_threshold=args.accuracy_threshold,
+        group_name=args.group_name,
+        approval_status=args.approval,
+        proc_instance=args.proc_instance,
+        train_instance=args.train_instance,
+        batch_instance=args.batch_instance,
+        batch_output_prefix=args.batch_output_prefix,
+        hpo_max_jobs=args.hpo_max_jobs,
+        hpo_parallel_jobs=args.hpo_parallel_jobs,
+    )
     print("Upserted REG pipeline and ensured MPG exists.")
 
 def reg_cmd_run(args):
@@ -586,16 +639,20 @@ def reg_cmd_run(args):
                     "Re-run with: reg run --role-arn <arn> --group-name <mpg>"
                 )
             print("REG pipeline missing; creating it now...")
-            _ensure_reg_pipeline(region=args.region,
-                                 role_arn=args.role_arn,
-                                 bucket=args.bucket,
-                                 acc_threshold=args.accuracy_threshold,
-                                 group_name=args.group_name,
-                                 approval_status=args.approval,
-                                 proc_instance=args.proc_instance,
-                                 train_instance=args.train_instance,
-                                 batch_instance=args.batch_instance,
-                                 batch_output_prefix=args.batch_output_prefix)
+            _ensure_reg_pipeline(
+                region=args.region,
+                role_arn=args.role_arn,
+                bucket=args.bucket,
+                acc_threshold=args.accuracy_threshold,
+                group_name=args.group_name,
+                approval_status=args.approval,
+                proc_instance=args.proc_instance,
+                train_instance=args.train_instance,
+                batch_instance=args.batch_instance,
+                batch_output_prefix=args.batch_output_prefix,
+                hpo_max_jobs=args.hpo_max_jobs,
+                hpo_parallel_jobs=args.hpo_parallel_jobs,
+            )
             start_resp = sm_sess.sagemaker_client.start_pipeline_execution(PipelineName=PIPELINE_NAME_REG)
             print("Started execution:", start_resp["PipelineExecutionArn"])
         else:
@@ -674,7 +731,7 @@ def main():
     p_run = procs.add_parser("run");    _proc_common(p_run)
 
     # REG
-    reg = sub.add_parser("reg", help="Estimator + Registry + Batch pipeline")
+    reg = sub.add_parser("reg", help="Estimator + HPO + Registry + Batch pipeline")
     regs = reg.add_subparsers(dest="cmd", required=True)
 
     def _reg_common(p):
@@ -689,9 +746,11 @@ def main():
     r_up.add_argument("--group-name", required=True)
     r_up.add_argument("--approval", default="PendingManualApproval")
     r_up.add_argument("--proc-instance", default="ml.t3.medium")
-    r_up.add_argument("--train-instance", default="ml.t3.medium")
+    r_up.add_argument("--train-instance", default="ml.m5.large")
     r_up.add_argument("--batch-instance", default="ml.m5.large")
     r_up.add_argument("--batch-output-prefix", default="")
+    r_up.add_argument("--hpo-max-jobs", type=int, default=6)
+    r_up.add_argument("--hpo-parallel-jobs", type=int, default=2)
 
     r_run = regs.add_parser("run"); _reg_common(r_run)
     r_run.add_argument("--role-arn", dest="role_arn", default="")
@@ -700,9 +759,11 @@ def main():
     r_run.add_argument("--accuracy-threshold", type=float, dest="accuracy_threshold", default=0.85)
     r_run.add_argument("--approval", default="PendingManualApproval")
     r_run.add_argument("--proc-instance", default="ml.t3.medium")
-    r_run.add_argument("--train-instance", default="ml.t3.medium")
+    r_run.add_argument("--train-instance", default="ml.m5.large")
     r_run.add_argument("--batch-instance", default="ml.m5.large")
     r_run.add_argument("--batch-output-prefix", default="")
+    r_run.add_argument("--hpo-max-jobs", type=int, default=6)
+    r_run.add_argument("--hpo-parallel-jobs", type=int, default=2)
 
     r_st = regs.add_parser("status"); _reg_common(r_st)
     r_desc = regs.add_parser("describe"); _reg_common(r_desc); r_desc.add_argument("--arn", required=True)
